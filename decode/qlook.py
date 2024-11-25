@@ -13,6 +13,7 @@ __all__ = [
 
 
 # standard library
+import copy
 from contextlib import contextmanager
 from logging import DEBUG, basicConfig, getLogger
 from pathlib import Path
@@ -27,10 +28,12 @@ import matplotlib.pyplot as plt
 from astropy.units import Quantity
 from fire import Fire
 from matplotlib.figure import Figure
+from scipy.optimize import curve_fit
 from . import assign, convert, load, make, plot, select, utils
 
 
 # constants
+ABBA_PHASES = {0, 1, 2, 3}
 DATA_FORMATS = "csv", "nc", "zarr", "zarr.zip"
 DEFAULT_DATA_TYPE = "auto"
 DEFAULT_DEBUG = False
@@ -41,6 +44,7 @@ DEFAULT_EXCL_MKID_IDS = None
 DEFAULT_INCL_MKID_IDS = None
 DEFAULT_MIN_FREQUENCY = None
 DEFAULT_MAX_FREQUENCY = None
+DEFAULT_ROLLING_TIME = 200
 DEFAULT_OUTDIR = Path()
 DEFAULT_OVERWRITE = False
 DEFAULT_SKYCOORD_GRID = "6 arcsec"
@@ -122,6 +126,7 @@ def daisy(
     max_frequency: Optional[str] = DEFAULT_MAX_FREQUENCY,
     data_type: Literal["auto", "brightness", "df/f"] = DEFAULT_DATA_TYPE,
     # options for analysis
+    rolling_time: int = DEFAULT_ROLLING_TIME,
     source_radius: str = "60 arcsec",
     chan_weight: Literal["uniform", "std", "std/tx"] = "std/tx",
     pwv: Literal["0.5", "1.0", "2.0", "3.0", "4.0", "5.0"] = "5.0",
@@ -150,6 +155,7 @@ def daisy(
             Defaults to no maximum frequency bound.
         data_type: Data type of the input DEMS file.
             Defaults to the ``long_name`` attribute in it.
+        rolling_time: Moving window size.
         source_radius: Radius of the on-source area.
             Other areas are considered off-source in sky subtraction.
         chan_weight: Weighting method along the channel axis.
@@ -188,6 +194,10 @@ def daisy(
         )
         da = select.by(da, "state", exclude="GRAD")
 
+        ### Rolling
+        da_rolled = da.rolling(time=int(rolling_time), center=True).mean()
+        da = da - da_rolled
+
         # fmt: off
         is_source = (
             (da.lon**2 + da.lat**2)
@@ -224,6 +234,25 @@ def daisy(
         )
         cont = cube.weighted(weight.fillna(0)).mean("chan")
 
+        ### GaussFit (cont)
+        try:
+            data = np.array(copy.deepcopy(cont).data)
+            data[np.isnan(data)] = 0.0
+            x, y = np.meshgrid(np.array(cube["lon"]), np.array(cube["lat"]))
+            initial_guess = (1, 0, 0, 1, 10, 0, 0)
+            bounds = (
+                [0, -np.inf, -np.inf, 1, 0, -np.pi, -np.inf],
+                [np.inf, np.inf, np.inf, np.inf, np.inf, 0, np.inf],
+            )
+            popt, pcov = curve_fit(
+                gaussian_2d, (x, y), data.ravel(), p0=initial_guess, bounds=bounds
+            )
+            perr = np.sqrt(np.diag(pcov))
+            data_fitted = gaussian_2d((x, y), *popt).reshape(x.shape)
+            is_gaussfit_successful = True
+        except:
+            is_gaussfit_successful = False
+
         # save result
         suffixes = f".{suffix}.{format}"
         file = Path(outdir) / Path(dems).with_suffix(suffixes).name
@@ -242,13 +271,40 @@ def daisy(
         max_pix = cont.where(cont == cont.max(), drop=True)
 
         cont.plot(ax=ax)  # type: ignore
+        if is_gaussfit_successful:
+            ax.contour(
+                data_fitted,
+                extent=(x.min(), x.max(), y.min(), y.max()),
+                origin="lower",
+                levels=np.linspace(0, popt[0], 9) + popt[6],
+                colors="k",
+                linewidths=[0.75, 0.75, 0.75, 0.75, 1.50, 0.75, 0.75, 0.75, 0.75],
+                linestyles="-",
+            )
+            ax.set_title(
+                f"Peak = {popt[0]:+.2e} [{cont.units}], "
+                f"dAz = {popt[1]:+.2f} [{cont.lon.attrs['units']}], "
+                f"dEl = {popt[2]:+.2f} [{cont.lat.attrs['units']}],\n"
+                f"FWHM_x = {popt[3]*popt[4]*2.354820:+.2f} [{skycoord_units}], "
+                f"FWHM_y = {popt[4]*2.354820:+.2f} [{skycoord_units}], "
+                f"P.A. = {-np.rad2deg(popt[5]+np.pi/2.0):+.1f} [deg],\n"
+                f"min_frequency = {min_frequency}, "
+                f"max_frequency = {max_frequency}",
+                fontsize=10,
+            )
+        else:
+            ax.set_title(
+                f"Peak = {cont.max():.2e} [{cont.units}], "
+                f"dAz = {float(max_pix.lon):+.1f} [{cont.lon.attrs['units']}], "
+                f"dEl = {float(max_pix.lat):+.1f} [{cont.lat.attrs['units']}],\n"
+                f"min_frequency = {min_frequency}, "
+                f"max_frequency = {max_frequency}\n"
+                "(Gaussian fit failed: dAz and dEl are peak pixel based)",
+                fontsize=10,
+            )
         ax.set_xlim(-map_lim, map_lim)
         ax.set_ylim(-map_lim, map_lim)
-        ax.set_title(
-            f"Maximum {cont.long_name.lower()} = {cont.max():.2e} [{cont.units}]\n"
-            f"(dAz = {float(max_pix.lon):+.1f} [{cont.lon.attrs['units']}], "
-            f"dEl = {float(max_pix.lat):+.1f} [{cont.lat.attrs['units']}])"
-        )
+        ax.axes.set_aspect("equal", "datalim")
 
         for ax in axes:  # type: ignore
             ax.grid(True)
@@ -318,10 +374,25 @@ def pswsc(
             frequency_units=frequency_units,
         )
 
+        da_despiked = despike(da)
+
+        # calculate ABBA cycles and phases
+        da_onoff = select.by(da_despiked, "state", ["ON", "OFF"])
+        scan_onoff = utils.phaseof(da_onoff.state)
+        chop_per_scan = da_onoff.beam.groupby(scan_onoff).apply(utils.phaseof)
+        is_second_half = chop_per_scan.groupby(scan_onoff).apply(
+            lambda group: (group >= group.mean())
+        )
+        abba_cycle = (scan_onoff * 2 + is_second_half - 1) // 4
+        abba_phase = (scan_onoff * 2 + is_second_half - 1) % 4
+
         # make spectrum
-        da_scan = select.by(da, "state", ["ON", "OFF"])
-        da_sub = da_scan.groupby("scan").map(subtract_per_scan)
-        spec = da_sub.mean("scan")
+        spec = (
+            da_onoff.assign_coords(abba_cycle=abba_cycle, abba_phase=abba_phase)
+            .groupby("abba_cycle")
+            .map(subtract_per_abba_cycle)
+            .mean("abba_cycle")
+        )
 
         # save result
         suffixes = f".{suffix}.{format}"
@@ -333,14 +404,14 @@ def pswsc(
         fig, axes = plt.subplots(1, 2, figsize=DEFAULT_FIGSIZE)
 
         ax = axes[0]  # type: ignore
-        plot.data(da.scan, ax=ax)
+        plot.data(da_despiked.scan, ax=ax)
 
         ax = axes[1]  # type: ignore
         plot.data(spec, x="frequency", s=5, hue=None, ax=ax)
         ax.set_ylim(get_robust_lim(spec))
 
         for ax in axes:  # type: ignore
-            ax.set_title(Path(dems).name)
+            ax.set_title(f"{Path(dems).name}\n({da.observation})")
             ax.grid(True)
 
         fig.tight_layout()
@@ -640,6 +711,25 @@ def raster(
         )
         cont = cube.weighted(weight.fillna(0)).mean("chan")
 
+        ### GaussFit (cont)
+        try:
+            data = np.array(copy.deepcopy(cont).data)
+            data[np.isnan(data)] = 0.0
+            x, y = np.meshgrid(np.array(cube["lon"]), np.array(cube["lat"]))
+            initial_guess = (1, 0, 0, 1, 10, 0, 0)
+            bounds = (
+                [0, -np.inf, -np.inf, 1, 0, -np.pi, -np.inf],
+                [np.inf, np.inf, np.inf, np.inf, np.inf, 0, np.inf],
+            )
+            popt, pcov = curve_fit(
+                gaussian_2d, (x, y), data.ravel(), p0=initial_guess, bounds=bounds
+            )
+            perr = np.sqrt(np.diag(pcov))
+            data_fitted = gaussian_2d((x, y), *popt).reshape(x.shape)
+            is_gaussfit_successful = True
+        except:
+            is_gaussfit_successful = False
+
         # save result
         suffixes = f".{suffix}.{format}"
         file = Path(outdir) / Path(dems).with_suffix(suffixes).name
@@ -658,13 +748,40 @@ def raster(
         max_pix = cont.where(cont == cont.max(), drop=True)
 
         cont.plot(ax=ax)  # type: ignore
+        if is_gaussfit_successful:
+            ax.contour(
+                data_fitted,
+                extent=(x.min(), x.max(), y.min(), y.max()),
+                origin="lower",
+                levels=np.linspace(0, popt[0], 9) + popt[6],
+                colors="k",
+                linewidths=[0.75, 0.75, 0.75, 0.75, 1.50, 0.75, 0.75, 0.75, 0.75],
+                linestyles="-",
+            )
+            ax.set_title(
+                f"Peak = {popt[0]:+.2e} [{cont.units}], "
+                f"dAz = {popt[1]:+.2f} [{cont.lon.attrs['units']}], "
+                f"dEl = {popt[2]:+.2f} [{cont.lat.attrs['units']}],\n"
+                f"FWHM_x = {popt[3]*popt[4]*2.354820:+.2f} [{skycoord_units}], "
+                f"FWHM_y = {popt[4]*2.354820:+.2f} [{skycoord_units}], "
+                f"P.A. = {-np.rad2deg(popt[5]+np.pi/2.0):+.1f} [deg],\n"
+                f"min_frequency = {min_frequency}, "
+                f"max_frequency = {max_frequency}",
+                fontsize=10,
+            )
+        else:
+            ax.set_title(
+                f"Peak = {cont.max():.2e} [{cont.units}], "
+                f"dAz = {float(max_pix.lon):+.1f} [{cont.lon.attrs['units']}], "
+                f"dEl = {float(max_pix.lat):+.1f} [{cont.lat.attrs['units']}],\n"
+                f"min_frequency = {min_frequency}, "
+                f"max_frequency = {max_frequency}\n"
+                "(Gaussian fit failed: dAz and dEl are peak pixel based)",
+                fontsize=10,
+            )
         ax.set_xlim(-map_lim, map_lim)
         ax.set_ylim(-map_lim, map_lim)
-        ax.set_title(
-            f"Maximum {cont.long_name.lower()} = {cont.max():.2e} [{cont.units}]\n"
-            f"(dAz = {float(max_pix.lon):+.1f} [{cont.lon.attrs['units']}], "
-            f"dEl = {float(max_pix.lat):+.1f} [{cont.lat.attrs['units']}])"
-        )
+        ax.axes.set_aspect("equal", "datalim")
 
         for ax in axes:  # type: ignore
             ax.grid(True)
@@ -763,7 +880,7 @@ def skydip(
         plot.data(series, x="secz", ax=ax)
 
         for ax in axes:  # type: ignore
-            ax.set_title(Path(dems).name)
+            ax.set_title(f"{Path(dems).name}\n({da.observation})")
             ax.grid(True)
 
         fig.tight_layout()
@@ -859,7 +976,7 @@ def still(
         plot.data(series, add_colorbar=False, ax=ax)
 
         for ax in axes:  # type: ignore
-            ax.set_title(Path(dems).name)
+            ax.set_title(f"{Path(dems).name}\n({da.observation})")
             ax.grid(True)
 
         fig.tight_layout()
@@ -1196,11 +1313,26 @@ def _scan(
         plot.data(series, x=f"aste_subref_{axis}", ax=ax)
 
         for ax in axes:  # type: ignore
-            ax.set_title(Path(dems).name)
+            ax.set_title(f"{Path(dems).name}\n({da.observation})")
             ax.grid(True)
 
         fig.tight_layout()
         return save_qlook(fig, file, overwrite=overwrite, **options)
+
+
+def despike(dems: xr.DataArray, /) -> xr.DataArray:
+    is_spike = (
+        xr.zeros_like(dems.time, bool)
+        .reset_coords(drop=True)
+        .groupby(utils.phaseof(dems.beam))
+        .map(flag_spike)
+    )
+    return dems.where(~is_spike, drop=True)
+
+
+def flag_spike(index: xr.DataArray, /) -> xr.DataArray:
+    index[:1] = index[-1:] = True
+    return index
 
 
 def mean_in_time(dems: xr.DataArray) -> xr.DataArray:
@@ -1209,31 +1341,52 @@ def mean_in_time(dems: xr.DataArray) -> xr.DataArray:
     return xr.zeros_like(middle) + dems.mean("time")
 
 
-def subtract_per_scan(dems: xr.DataArray) -> xr.DataArray:
-    """Apply source-sky subtraction to a single-scan DEMS."""
+def subtract_per_abba_cycle(dems: xr.DataArray, /) -> xr.DataArray:
+    """Subtract sky from source with atmospheric correction for each ABBA cycle.
+
+    Args:
+        dems: 2D DataArray (time x chan) of DEMS per ABBA cycle.
+
+    Returns:
+        1D DataArray (chan) of the mean spectrum after subtraction and correction.
+        If ABBA phases per cycle are incomplete, i.e., some phases are missing,
+        a spectrum filled with NaN will be returned instead.
+
+    """
+    if not set(np.unique(dems.abba_phase)) == ABBA_PHASES:
+        return dems.mean("time") * np.nan
+
+    return dems.groupby("abba_phase").map(subtract_per_abba_phase).mean("abba_phase")
+
+
+def subtract_per_abba_phase(dems: xr.DataArray, /) -> xr.DataArray:
+    """Subtract sky from source with atmospheric correction for each ABBA phase.
+
+    Args:
+        dems: 2D DataArray (time x chan) of DEMS per ABBA phase.
+
+    Returns:
+        1D DataArray (chan) of the mean spectrum after subtraction and correction.
+
+    Raises:
+        ValueError: Raised if ``dems.state`` is not ON-only nor OFF-only.
+
+    """
     t_amb = 273.15
+
     if len(states := np.unique(dems.state)) != 1:
         raise ValueError("State must be unique.")
 
-    if (state := states[0]) == "ON":
-        src = select.by(dems, "beam", include="A")
-        sky = select.by(dems, "beam", include="B")
-        return (
-            t_amb
-            * (src.mean("time") - sky.mean("time").data)
-            / ((t_amb - sky.mean("time")))
-        )
+    if states[0] == "ON":
+        src = select.by(dems, "beam", include="A").mean("time")
+        sky = select.by(dems, "beam", include="B").mean("time")
+    elif states[0] == "OFF":
+        src = select.by(dems, "beam", include="B").mean("time")
+        sky = select.by(dems, "beam", include="A").mean("time")
+    else:
+        raise ValueError("State must be either ON or OFF.")
 
-    if state == "OFF":
-        src = select.by(dems, "beam", include="B")
-        sky = select.by(dems, "beam", include="A")
-        return (
-            t_amb
-            * (src.mean("time") - sky.mean("time").data)
-            / ((t_amb - sky.mean("time")))
-        )
-
-    raise ValueError("State must be either ON or OFF.")
+    return t_amb * (src - sky.data) / (t_amb - sky)
 
 
 def get_chan_weight(
@@ -1425,6 +1578,24 @@ def save_qlook(
         return path
 
     raise ValueError("Extension of filename is not valid.")
+
+
+def gaussian_2d(xy, amp, x0, y0, sigma_x_over_y, sigma_y, theta, offset):
+    x, y = xy
+    x0 = float(x0)
+    y0 = float(y0)
+    sigma_x = sigma_y * sigma_x_over_y
+    a = (np.cos(theta) ** 2) / (2 * sigma_x**2) + (np.sin(theta) ** 2) / (
+        2 * sigma_y**2
+    )
+    b = -(np.sin(2 * theta)) / (4 * sigma_x**2) + (np.sin(2 * theta)) / (4 * sigma_y**2)
+    c = (np.sin(theta) ** 2) / (2 * sigma_x**2) + (np.cos(theta) ** 2) / (
+        2 * sigma_y**2
+    )
+    g = offset + amp * np.exp(
+        -(a * ((x - x0) ** 2) + 2 * b * (x - x0) * (y - y0) + c * ((y - y0) ** 2))
+    )
+    return g.ravel()
 
 
 def main() -> None:
