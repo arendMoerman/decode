@@ -2,6 +2,7 @@ __all__ = [
     "auto",
     "daisy",
     "pswsc",
+    "daisy_AB",
     "raster",
     "skydip",
     "still",
@@ -340,6 +341,199 @@ def pswsc(
 
         for ax in axes:  # type: ignore
             ax.set_title(Path(dems).name)
+            ax.grid(True)
+
+        fig.tight_layout()
+        return save_qlook(fig, file, overwrite=overwrite, **options)
+
+def daisy_AB(
+    dems: Path,
+    /,
+    *,
+    # options for loading
+    include_mkid_ids: Optional[Sequence[int]] = DEFAULT_INCL_MKID_IDS,
+    exclude_mkid_ids: Optional[Sequence[int]] = DEFAULT_EXCL_MKID_IDS,
+    min_frequency: Optional[str] = DEFAULT_MIN_FREQUENCY,
+    max_frequency: Optional[str] = DEFAULT_MAX_FREQUENCY,
+    data_type: Literal["auto", "brightness", "df/f"] = DEFAULT_DATA_TYPE,
+    # options for analysis
+    source_radius: str = "60 arcsec",
+    chan_weight: Literal["uniform", "std", "std/tx"] = "std/tx",
+    pwv: Literal["0.5", "1.0", "2.0", "3.0", "4.0", "5.0"] = "5.0",
+    skycoord_grid: str = DEFAULT_SKYCOORD_GRID,
+    skycoord_units: str = DEFAULT_SKYCOORD_UNITS,
+    # options for saving
+    format: str = DEFAULT_FORMAT,
+    outdir: Path = DEFAULT_OUTDIR,
+    overwrite: bool = DEFAULT_OVERWRITE,
+    suffix: str = "daisy_AB",
+    # other options
+    debug: bool = DEFAULT_DEBUG,
+    **options: Any,
+) -> Path:
+    """Quick-look at a daisy scan with AB chopping observation.
+
+    Args:
+        dems: Input DEMS file (netCDF or Zarr).
+        include_mkid_ids: MKID IDs to be included in analysis.
+            Defaults to all MKID IDs.
+        exclude_mkid_ids: MKID IDs to be excluded in analysis.
+            Defaults to no MKID IDs.
+        min_frequency: Minimum frequency to be included in analysis.
+            Defaults to no minimum frequency bound.
+        max_frequency: Maximum frequency to be included in analysis.
+            Defaults to no maximum frequency bound.
+        data_type: Data type of the input DEMS file.
+            Defaults to the ``long_name`` attribute in it.
+        source_radius: Radius of the on-source area.
+            Other areas are considered off-source in sky subtraction.
+        chan_weight: Weighting method along the channel axis.
+            uniform: Uniform weight (i.e. no channel dependence).
+            std: Inverse square of temporal standard deviation of sky.
+            std/tx: Same as std but std is divided by the atmospheric
+            transmission calculated by the ATM model.
+        pwv: PWV in units of mm. Only used for the calculation of
+            the atmospheric transmission when chan_weight is std/tx.
+        skycoord_grid: Grid size of the sky coordinate axes.
+        skycoord_units: Units of the sky coordinate axes.
+        format: Output image format of quick-look result.
+        outdir: Output directory for the quick-look result.
+        overwrite: Whether to overwrite the output if it exists.
+        suffix: Suffix that precedes the file extension.
+        debug: Whether to print detailed logs for debugging.
+        **options: Other options for saving the output (e.g. dpi).
+
+    Returns:
+        Absolute path of the saved file.
+
+    """
+    with set_logger(debug):
+        for key, val in locals().items():
+            LOGGER.debug(f"{key}: {val!r}")
+
+    with xr.set_options(keep_attrs=True):
+        da = load_dems(
+            dems,
+            include_mkid_ids=include_mkid_ids,
+            exclude_mkid_ids=exclude_mkid_ids,
+            min_frequency=min_frequency,
+            max_frequency=max_frequency,
+            data_type=data_type,
+            skycoord_units=skycoord_units,
+        )
+
+        src = "A"
+        sky = "B"
+
+        da_sub = select.by(da, "state", include="SCAN")
+
+        idx_src = np.squeeze(np.argwhere(da_sub.beam.data == src))
+        idx_sky = np.squeeze(np.argwhere(da_sub.beam.data == sky))
+
+        test = da_sub[idx_src]
+        plt.plot(test[:,0])
+        plt.show()
+
+        # Get chunk start-stop indices for beam A
+        # Now remove ends of each window to remove spikes
+        cap = 1
+        
+        store_src = []
+        idx_start = idx_src[0]
+        idx_end = 0
+        for i in range(len(idx_src)):
+            if idx_src[i] != (idx_src[i-1] + 1): # Current index does not belong to chunk anymore.
+                idx_end = idx_src[i-1]
+                store_src.append((idx_start + cap, idx_end - cap))
+                idx_start = idx_src[i]
+        
+
+        store_sky = []
+        idx_start = idx_sky[0]
+        idx_end = 0
+        for i in range(len(idx_sky)):
+            if idx_sky[i] != (idx_sky[i-1] + 1): # Current index does not belong to chunk anymore.
+                idx_end = idx_sky[i-1]
+                store_sky.append((idx_start + cap, idx_end - cap))
+                idx_start = idx_sky[i]
+        
+        num_chunk = min(len(store_sky), len(store_src))
+
+        for idx_chunk in range(num_chunk):
+            idx_lo_src = store_src[idx_chunk][0]
+            idx_hi_src = store_src[idx_chunk][1] + 1
+            
+            idx_lo_sky = store_sky[idx_chunk][0]
+            idx_hi_sky = store_sky[idx_chunk][1] + 1
+
+            avg_chunk_sky = np.nanmean(da_sub.data[idx_lo_sky:idx_hi_sky,:], axis=0)
+            plt.plot(avg_chunk_sky)
+            plt.show()
+            da_sub.data[idx_lo_src:idx_hi_src,:] -= avg_chunk_sky
+            da_sub.data[idx_lo_sky:idx_hi_sky,:] -= avg_chunk_sky
+
+            plt.plot(da_sub.data[idx_lo_src:idx_hi_src,0])
+            plt.show()
+
+        ## Now throw away everything before and beyond last beam A chunk
+        da_sub = da_sub[store_src[1][0]:store_sky[num_chunk-1][1],:]
+        plt.plot(da_sub.data[:,0])
+        plt.show()
+
+
+        da_on = select.by(da_sub, "beam", include=src)
+        da_off = select.by(da_sub, "beam", include=sky)
+        
+        # make continuum series
+        weight = get_chan_weight(da_off, method=chan_weight, pwv=pwv)
+        series = da_sub.weighted(weight.fillna(0)).mean("chan")
+
+        lon_test = da.lon.data.shape
+
+        lon_orig = da_sub.lon.data
+        lat_orig = da_sub.lat.data
+
+        print(lon_test, lon_orig.shape)
+
+        lon = da_on.lon.data
+        lat = da_on.lat.data
+
+        # make continuum map
+        cube = make.cube(
+            da_on,
+            skycoord_grid=skycoord_grid,
+            skycoord_units=skycoord_units,
+        )
+
+        cont = cube.weighted(weight.fillna(0)).mean("chan")
+
+        # save result
+        suffixes = f".{suffix}.{format}"
+        file = Path(outdir) / Path(dems).with_suffix(suffixes).name
+
+        if format in DATA_FORMATS:
+            return save_qlook(cont, file, overwrite=overwrite, **options)
+
+        fig, axes = plt.subplots(1, 2, figsize=(12, 5.5))
+
+        ax = axes[0]  # type: ignore
+        plot.data(series, ax=ax)
+        ax.set_title(f"{Path(dems).name}\n({da.observation})")
+
+        ax = axes[1]  # type: ignore
+        map_lim = max(abs(cube.lon).max(), abs(cube.lat).max())
+        max_pix = cont.where(cont == cont.max(), drop=True)
+
+        cont.plot(ax=ax)  # type: ignore
+        ax.set_xlim(-map_lim, map_lim)
+        ax.set_ylim(-map_lim, map_lim)
+        ax.set_title(
+            f"Maximum {cont.long_name.lower()} = {cont.max():.2e} [{cont.units}]\n"
+            f"(dAz = {float(max_pix.lon):+.1f} [{cont.lon.attrs['units']}], "
+            f"dEl = {float(max_pix.lat):+.1f} [{cont.lat.attrs['units']}])"
+        )
+
+        for ax in axes:  # type: ignore
             ax.grid(True)
 
         fig.tight_layout()

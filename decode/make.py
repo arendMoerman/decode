@@ -58,9 +58,15 @@ def cube(
     dems.coords.update({"index": index})
     gridded = dems.groupby("index").mean("time")
 
+    gridded_var = dems.groupby("index").var("time")
+
     data = np.full([n_lat * n_lon, n_chan], np.nan)
     data[gridded.index.values] = gridded.values
     data = data.reshape(n_lat, n_lon, n_chan).transpose(2, 0, 1)
+    
+    data_var = np.full([n_lat * n_lon, n_chan], np.nan)
+    data_var[gridded_var.index.values] = gridded_var.values
+    data_var = data_var.reshape(n_lat, n_lon, n_chan).transpose(2, 0, 1)
 
     cube = Cube.new(
         data=data,
@@ -74,4 +80,18 @@ def cube(
     )
     cube = convert.coord_units(cube, "lon", skycoord_units)
     cube = convert.coord_units(cube, "lat", skycoord_units)
-    return cube
+    
+    cube_var = Cube.new(
+        data=data_var,
+        lat=lat,
+        lon=lon,
+        chan=dems.chan,
+        frame=dems.frame,
+        d2_mkid_id=dems.d2_mkid_id,
+        d2_mkid_frequency=dems.d2_mkid_frequency,
+        d2_mkid_type=dems.d2_mkid_type,
+    )
+    cube_var = convert.coord_units(cube_var, "lon", skycoord_units)
+    cube_var = convert.coord_units(cube_var, "lat", skycoord_units)
+
+    return cube, cube_var
